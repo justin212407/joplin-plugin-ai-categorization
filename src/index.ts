@@ -95,22 +95,68 @@ async function getEmbedding(text: string): Promise<number[]> {
     }
 }
 
-async function embedAllNotes(notes: NoteWithBody[]): Promise<EmbeddedNote[]> {
+async function embedAllNotes(notes: NoteWithBody[]): Promise<{ notes: EmbeddedNote[]; avgMs: number; dimsconfirmed: number }> {
     const results: EmbeddedNote[] = [];
+    const timings: number[] = [];
+    const batchStart = Date.now();
 
     for (let i = 0; i < notes.length; i++) {
         const note = notes[i];
-        console.log(`[Step 2] Embedding note ${i + 1} of ${notes.length}: ${note.title}`);
+        const noteStart = Date.now();
         const embedding = await getEmbedding(note.title + '\n' + note.body);
+        const elapsed = Date.now() - noteStart;
+        timings.push(elapsed);
+
+        const notesProcessed = i + 1;
+        const elapsedBatchSec = (Date.now() - batchStart) / 1000;
+        const cumulative = elapsedBatchSec > 0 ? notesProcessed / elapsedBatchSec : 0;
+
+        console.warn(`[Step 2] [${notesProcessed}/${notes.length}] ${note.title} — ${elapsed}ms (${embedding.length}d) | cumulative: ${cumulative.toFixed(1)} notes/sec`);
+
         if (embedding.length === 0) {
             console.log(`[Step 2] Skipped (empty embedding): ${note.title}`);
             continue;
         }
+
         results.push({ id: note.id, title: note.title, embedding });
     }
 
+    const totalSec = (Date.now() - batchStart) / 1000;
+
+    if (timings.length > 0) {
+        const sorted = [...timings].sort((a, b) => a - b);
+        const sum = timings.reduce((acc, t) => acc + t, 0);
+        const avg = sum / timings.length;
+        const p50 = sorted[Math.floor(sorted.length / 2)];
+        const p90 = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.9))];
+        const throughput = totalSec > 0 ? timings.length / totalSec : 0;
+        const embeddingDims = results.length > 0 ? results[0].embedding.length : 0;
+
+        console.warn(`[Step 2] Batch complete: ${timings.length} notes in ${totalSec.toFixed(2)}s`);
+        console.warn(`[Step 2] Throughput: ${throughput.toFixed(1)} notes/sec`);
+        console.warn(`[Step 2] Latency: avg=${Math.round(avg)}ms p50=${Math.round(p50)}ms p90=${Math.round(p90)}ms`);
+        console.warn(`[Step 2] Embedding dimensions: ${embeddingDims}`);
+
+        if (timings.length >= 4) {
+            const midpoint = Math.floor(timings.length / 2);
+            const firstHalf = timings.slice(0, midpoint);
+            const secondHalf = timings.slice(midpoint);
+
+            const firstHalfAvg = firstHalf.reduce((acc, t) => acc + t, 0) / firstHalf.length;
+            const secondHalfAvg = secondHalf.reduce((acc, t) => acc + t, 0) / secondHalf.length;
+            const percentChange = firstHalfAvg === 0 ? 0 : ((secondHalfAvg - firstHalfAvg) / firstHalfAvg) * 100;
+
+            console.warn(`[Step 2] Throughput degradation: first half ${Math.round(firstHalfAvg)}ms/note → second half ${Math.round(secondHalfAvg)}ms/note (${percentChange.toFixed(1)}% change)`);
+        }
+    }
+
+    const avgMs = timings.length > 0
+        ? timings.reduce((acc, t) => acc + t, 0) / timings.length
+        : 0;
+    const dimsconfirmed = results.length > 0 ? results[0].embedding.length : 0;
+
     console.log(`[Step 2] Embedding complete. ${results.length} notes embedded.`);
-    return results;
+    return { notes: results, avgMs, dimsconfirmed };
 }
 
 // ─── Step 3: Clustering ──────────────────────────────────────────────────────
@@ -175,6 +221,73 @@ function clusterNotes(embeddedNotes: EmbeddedNote[], threshold = 0.75): Cluster[
     return multiNoteClusters;
 }
 
+function simplifiedSilhouetteScore(embeddedNotes: EmbeddedNote[], clusters: Cluster[]): number {
+    if (clusters.length < 2) return 0;
+
+    const embeddingById = new Map<string, number[]>();
+    for (const note of embeddedNotes) {
+        embeddingById.set(note.id, note.embedding);
+    }
+
+    let totalScore = 0;
+    let count = 0;
+
+    for (let i = 0; i < clusters.length; i++) {
+        const ownCluster = clusters[i];
+
+        for (const member of ownCluster.notes) {
+            const memberEmbedding = embeddingById.get(member.id);
+            if (!memberEmbedding) continue;
+
+            const ownPeers = ownCluster.notes.filter(n => n.id !== member.id);
+            if (ownPeers.length === 0) continue;
+
+            let ownDistanceSum = 0;
+            let ownDistanceCount = 0;
+            for (const peer of ownPeers) {
+                const peerEmbedding = embeddingById.get(peer.id);
+                if (!peerEmbedding) continue;
+                ownDistanceSum += 1 - cosineSimilarity(memberEmbedding, peerEmbedding);
+                ownDistanceCount += 1;
+            }
+            if (ownDistanceCount === 0) continue;
+            const a = ownDistanceSum / ownDistanceCount;
+
+            let nearestOtherAvg = Number.POSITIVE_INFINITY;
+            for (let j = 0; j < clusters.length; j++) {
+                if (j === i) continue;
+
+                const otherCluster = clusters[j];
+                let otherDistanceSum = 0;
+                let otherDistanceCount = 0;
+
+                for (const otherMember of otherCluster.notes) {
+                    const otherEmbedding = embeddingById.get(otherMember.id);
+                    if (!otherEmbedding) continue;
+                    otherDistanceSum += 1 - cosineSimilarity(memberEmbedding, otherEmbedding);
+                    otherDistanceCount += 1;
+                }
+
+                if (otherDistanceCount === 0) continue;
+                const otherAvg = otherDistanceSum / otherDistanceCount;
+                if (otherAvg < nearestOtherAvg) nearestOtherAvg = otherAvg;
+            }
+
+            if (!Number.isFinite(nearestOtherAvg)) continue;
+            const b = nearestOtherAvg;
+
+            const denom = Math.max(a, b);
+            if (denom === 0) continue;
+
+            const s = (b - a) / denom;
+            totalScore += s;
+            count += 1;
+        }
+    }
+
+    return count === 0 ? 0 : totalScore / count;
+}
+
 // ─── Step 4: LLM Labelling ───────────────────────────────────────────────────
 
 async function getClusterLabel(noteTitles: string[]): Promise<string> {
@@ -231,6 +344,7 @@ async function labelAllClusters(
 
 joplin.plugins.register({
     onStart: async () => {
+        const pluginStart = Date.now();
 
         // Helper: write progress to a dedicated output note
         let outputNoteId: string | null = null;
@@ -257,6 +371,16 @@ joplin.plugins.register({
         }
 
         await log('=== AI Categorization POC Starting ===');
+
+        const warmupStart = Date.now();
+        const warmupEmbedding = await getEmbedding('warmup sentence for timing measurement');
+        const warmupMs = Date.now() - warmupStart;
+        if (warmupEmbedding.length === 0) {
+            console.warn('ERROR: Ollama not reachable. Run: ollama serve');
+            return;
+        }
+        console.warn(`[Pre-check] Ollama warmup: ${warmupMs}ms | model ready | dims: ${warmupEmbedding.length}`);
+
         await flushToNote();
 
         // Step 1
@@ -270,22 +394,14 @@ joplin.plugins.register({
             return;
         }
 
-        // Test Ollama before embedding all notes
-        await log('[Pre-check] Testing Ollama connection...');
-        const testEmb = await getEmbedding('test connection');
-        if (testEmb.length === 0) {
-            await log('ERROR: Ollama is not reachable at http://127.0.0.1:11434');
-            await log('Make sure you ran: ollama serve');
-            await log('And pulled the model: ollama pull nomic-embed-text');
-            await flushToNote();
-            return;
-        }
-        await log(`[Pre-check] Ollama OK. Embedding dimension: ${testEmb.length}`);
-        await flushToNote();
-
         // Step 2
-        const embedded = await embedAllNotes(notes);
+        const step2Start = Date.now();
+        const { notes: embedded, avgMs, dimsconfirmed } = await embedAllNotes(notes);
+        const batchDurationMs = Date.now() - step2Start;
+        const throughput = embedded.length / (batchDurationMs / 1000);
         await log(`[Step 2] Embedding complete. ${embedded.length} notes embedded.`);
+        await log(`[Step 2] Throughput: ${throughput.toFixed(1)} notes/sec | avg ${Math.round(avgMs)}ms/note`);
+        await log(`[Step 2] Dimensions confirmed: ${dimsconfirmed}d vectors`);
         await flushToNote();
 
         if (embedded.length < 2) {
@@ -296,13 +412,45 @@ joplin.plugins.register({
 
         // Step 3
         const clusters = clusterNotes(embedded, 0.60);
-        await log(`[Step 3] Found ${clusters.length} clusters.`);
+        const silhouette = clusters.length >= 2
+            ? simplifiedSilhouetteScore(embedded, clusters)
+            : 0;
+        await log(`[Step 3] Found ${clusters.length} clusters. ` +
+            `Silhouette score: ${silhouette.toFixed(3)} ` +
+            `(0=random, 1=perfect separation)`);
+        await log(`[Step 3] Cluster quality: ${
+            silhouette > 0.7 ? 'STRONG' :
+            silhouette > 0.5 ? 'MODERATE' :
+            silhouette > 0.3 ? 'WEAK' : 'POOR'
+        } — threshold used: 0.60`);
         await flushToNote();
 
         if (clusters.length === 0) {
-            await log('No clusters found. Try lowering threshold below 0.60.');
+            await log('No clusters found. Silhouette sweep recommended.');
+            await log('Try running with threshold values: 0.45, 0.50, 0.55, 0.60, 0.65');
             await flushToNote();
             return;
+        }
+
+        if (embedded.length >= 2) {
+            const knnStart = Date.now();
+            const queryNote = embedded[0];
+
+            const nearest = embedded
+                .filter(note => note.id !== queryNote.id)
+                .map(note => ({
+                    title: note.title,
+                    score: cosineSimilarity(queryNote.embedding, note.embedding),
+                }))
+                .sort((a, b) => b.score - a.score)
+                .slice(0, 5);
+
+            const knnMs = Date.now() - knnStart;
+            await log(`[KNN] Search k=5 over ${embedded.length} vectors: ${knnMs}ms`);
+            await log(`[KNN] Nearest neighbours for '${queryNote.title}':`);
+            for (const item of nearest) {
+                await log(`  [${item.score.toFixed(3)}] ${item.title}`);
+            }
         }
 
         // Step 4
@@ -315,7 +463,25 @@ joplin.plugins.register({
             for (const t of c.noteTitles) await log(`   - ${t}`);
         }
         await log('=== END SUGGESTIONS ===');
+
+        const notesPerSec = embedded.length / (batchDurationMs / 1000);
+        await log('');
+        await log('=== PERFORMANCE PROJECTIONS ===');
+        await log(`Backend: Ollama (nomic-embed-text) | ${dimsconfirmed}d vectors`);
+        await log(`Measured: ${notesPerSec.toFixed(1)} notes/sec | avg ${Math.round(avgMs)}ms/note`);
+        await log(`  100 notes → ${(100 / notesPerSec).toFixed(1)}s`);
+        await log(`  500 notes → ${(500 / notesPerSec / 60).toFixed(1)} min`);
+        await log(` 1000 notes → ${(1000 / notesPerSec / 60).toFixed(1)} min`);
+        await log(` 5000 notes → ${(5000 / notesPerSec / 60).toFixed(1)} min`);
+        await log('');
+        await log('Note: These are Ollama (local server) timings.');
+        await log('Production uses incremental indexing — only changed notes re-embedded.');
+        await log('=== END PROJECTIONS ===');
+
         await log('NOTE: No changes made to Joplin. Read-only analysis.');
         await flushToNote();
+
+        const totalSec = ((Date.now() - pluginStart) / 1000).toFixed(2);
+        console.warn(`[Total] Full pipeline completed in ${totalSec}s`);
     },
 });
