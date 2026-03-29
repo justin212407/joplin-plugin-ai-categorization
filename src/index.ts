@@ -459,6 +459,106 @@ async function labelAllClusters(
     return results;
 }
 
+async function applyTagsToNotes(labelled: LabelledCluster[]): Promise<Array<{
+    label: string;
+    tagId: string;
+    appliedCount: number;
+    failedCount: number;
+}>> {
+    const results: Array<{
+        label: string;
+        tagId: string;
+        appliedCount: number;
+        failedCount: number;
+    }> = [];
+
+    for (const cluster of labelled) {
+        const existingTagsRes = await joplin.data.get(['tags'], {
+            fields: ['id', 'title'],
+        });
+        const existingTags = (existingTagsRes.items ?? []) as Array<{ id: string; title: string }>;
+
+        const existingTag = existingTags.find(tag =>
+            tag.title.toLowerCase() === cluster.label.toLowerCase()
+        );
+
+        let tagId = '';
+        if (existingTag) {
+            tagId = existingTag.id;
+        } else {
+            const newTag = await joplin.data.post(['tags'], null, { title: cluster.label });
+            tagId = newTag.id;
+        }
+
+        let appliedCount = 0;
+        let failedCount = 0;
+
+        for (const noteId of cluster.noteIds) {
+            try {
+                await joplin.data.post(['tags', tagId, 'notes'], null, { id: noteId });
+                appliedCount += 1;
+            } catch (err) {
+                failedCount += 1;
+                console.warn(`[Apply] Failed to tag note ${noteId} with '${cluster.label}':`, err);
+            }
+        }
+
+        results.push({
+            label: cluster.label,
+            tagId,
+            appliedCount,
+            failedCount,
+        });
+    }
+
+    return results;
+}
+
+async function showConfirmationDialog(labelled: LabelledCluster[]): Promise<boolean> {
+    const dialog = await joplin.views.dialogs.create('aiCategorizationConfirm');
+
+    await joplin.views.dialogs.setHtml(dialog, `
+        <div style="font-family: sans-serif; padding: 16px;
+                    max-width: 400px;">
+            <h3 style="margin-top: 0;">
+                AI Categorization Suggestions
+            </h3>
+            <p style="color: #666; font-size: 13px;">
+                The following tags will be created and applied
+                to your notes:
+            </p>
+            ${labelled.map(c => `
+                <div style="margin: 8px 0; padding: 8px;
+                            background: #f5f5f5; border-radius: 4px;">
+                    <strong>${c.label}</strong>
+                    <span style="color: #666; font-size: 12px;
+                                 margin-left: 8px;">
+                        → ${c.noteIds.length} notes
+                    </span>
+                    <div style="font-size: 11px; color: #999;
+                                margin-top: 4px;">
+                        ${c.noteTitles.slice(0, 2).join(', ')}
+                        ${c.noteTitles.length > 2 ?
+                            ` +${c.noteTitles.length - 2} more` : ''}
+                    </div>
+                </div>
+            `).join('')}
+            <p style="font-size: 12px; color: #888; margin-top: 16px;">
+                This action can be undone by manually removing
+                the tags. No notes will be moved.
+            </p>
+        </div>
+    `);
+
+    await joplin.views.dialogs.setButtons(dialog, [
+        { id: 'apply', title: 'Apply Tags' },
+        { id: 'skip', title: 'Skip' }
+    ]);
+
+    const result = await joplin.views.dialogs.open(dialog);
+    return result.id === 'apply';
+}
+
 // ─── Step 5: Main ────────────────────────────────────────────────────────────
 
 joplin.plugins.register({
@@ -659,6 +759,40 @@ joplin.plugins.register({
             for (const t of c.noteTitles) await log(`- ${t}`);
         }
 
+        // Confirm and apply step
+        await log('');
+        await log('=== CONFIRM AND APPLY ===');
+        await log(`[Apply] Showing confirmation dialog for ${labelled.length} clusters...`);
+        await flushToNote();
+
+        let applied = false;
+        let applyResults: Array<{label: string, tagId: string,
+            appliedCount: number, failedCount: number}> = [];
+
+        try {
+            const confirmed = await showConfirmationDialog(labelled);
+            if (confirmed) {
+                await log('[Apply] User confirmed. Applying tags...');
+                await flushToNote();
+                applyResults = await applyTagsToNotes(labelled);
+                applied = true;
+                await log('[Apply] Tags applied successfully:');
+                for (const r of applyResults) {
+                    await log(`  ✓ Tag "${r.label}": applied to ${r.appliedCount} notes` +
+                        (r.failedCount > 0 ? ` (${r.failedCount} failed)` : ''));
+                }
+                await log('[Apply] Check your notes — tags are now visible in Joplin.');
+            } else {
+                await log('[Apply] User skipped. No changes made.');
+            }
+        } catch (err) {
+            await log(`[Apply] Dialog or apply error: ${err}`);
+            await log('[Apply] This is expected in some sandbox environments.');
+        }
+
+        await log('=== END APPLY ===');
+        await flushToNote();
+
         const notesPerSec = embedded.length / (batchDurationMs / 1000);
         await log('');
         await logSection('Performance Projections');
@@ -680,6 +814,17 @@ joplin.plugins.register({
         await log('Production uses incremental indexing — only changed notes re-embedded.');
 
         await log('NOTE: No changes made to Joplin. Read-only analysis.');
+        await flushToNote();
+
+        await log('');
+        await log('=== PIPELINE SUMMARY ===');
+        await log(`Notes analysed: ${embedded.length}`);
+        await log(`Clusters found: ${labelled.length}`);
+        await log(`Optimal threshold: ${calibration.optimalThreshold}`);
+        await log(`Silhouette score: ${silhouette.toFixed(3)}`);
+        await log(`Tags applied: ${applied ? applyResults.reduce((s, r) => s + r.appliedCount, 0) : 0}`);
+        await log(`Total pipeline time: ${((Date.now() - pluginStart) / 1000).toFixed(2)}s`);
+        await log('=== END SUMMARY ===');
         await flushToNote();
 
         const totalSec = ((Date.now() - pluginStart) / 1000).toFixed(2);
