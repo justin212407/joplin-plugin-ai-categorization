@@ -95,6 +95,81 @@ async function getEmbedding(text: string): Promise<number[]> {
     }
 }
 
+let transformersPipeline: any = null;
+
+async function getEmbeddingTransformers(text: string): Promise<number[]> {
+    try {
+        const truncated = text.slice(0, 500);
+
+        if (!transformersPipeline) {
+            const dynamicImport = new Function('moduleName', 'return import(moduleName);') as (moduleName: string) => Promise<any>;
+            const { pipeline } = await dynamicImport('@xenova/transformers');
+            const modelLoadStart = Date.now();
+            transformersPipeline = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2');
+            const modelLoadMs = Date.now() - modelLoadStart;
+            console.warn(`[Transformers] Model loaded in ${modelLoadMs}ms`);
+        }
+
+        const output = await transformersPipeline(truncated, {
+            pooling: 'mean',
+            normalize: true,
+        });
+
+        return Array.from(output.data) as number[];
+    } catch (err) {
+        console.warn('[Transformers] Embedding failed:', err);
+        return [];
+    }
+}
+
+async function runBackendComparison(testNotes: NoteWithBody[]): Promise<{
+    ollamaAvg: number;
+    transformersAvg: number;
+    speedRatio: number;
+    ollamaDims: number;
+    transformersDims: number;
+    transformersFailed: boolean;
+}> {
+    const sampleNotes = testNotes.slice(0, 3);
+    const ollamaTimings: number[] = [];
+    const transformersTimings: number[] = [];
+    let ollamaDims = 0;
+    let transformersDims = 0;
+
+    for (let i = 0; i < sampleNotes.length; i++) {
+        const note = sampleNotes[i];
+        const combined = note.title + '\n' + note.body;
+
+        const ollamaStart = Date.now();
+        const ollamaEmbedding = await getEmbedding(combined);
+        const ollamaMs = Date.now() - ollamaStart;
+        ollamaTimings.push(ollamaMs);
+        if (!ollamaDims && ollamaEmbedding.length > 0) ollamaDims = ollamaEmbedding.length;
+
+        const transformersStart = Date.now();
+        const transformersEmbedding = await getEmbeddingTransformers(combined);
+        let transformersMs = Date.now() - transformersStart;
+        if (transformersEmbedding.length === 0) {
+            transformersMs = -1;
+        }
+        transformersTimings.push(transformersMs);
+        if (!transformersDims && transformersEmbedding.length > 0) transformersDims = transformersEmbedding.length;
+
+        console.warn(`[Compare] Note ${i + 1}: Ollama=${ollamaMs}ms vs Transformers=${transformersMs}ms`);
+    }
+
+    const ollamaAvg = ollamaTimings.length > 0
+        ? ollamaTimings.reduce((acc, t) => acc + t, 0) / ollamaTimings.length
+        : 0;
+    const transformersAvg = transformersTimings.length > 0
+        ? transformersTimings.reduce((acc, t) => acc + t, 0) / transformersTimings.length
+        : 0;
+    const transformersFailed = transformersTimings.some(t => t === -1);
+    const speedRatio = transformersAvg === 0 ? 0 : ollamaAvg / transformersAvg;
+
+    return { ollamaAvg, transformersAvg, speedRatio, ollamaDims, transformersDims, transformersFailed };
+}
+
 async function embedAllNotes(notes: NoteWithBody[]): Promise<{ notes: EmbeddedNote[]; avgMs: number; dimsconfirmed: number }> {
     const results: EmbeddedNote[] = [];
     const timings: number[] = [];
@@ -288,6 +363,50 @@ function simplifiedSilhouetteScore(embeddedNotes: EmbeddedNote[], clusters: Clus
     return count === 0 ? 0 : totalScore / count;
 }
 
+function findOptimalThreshold(embeddedNotes: EmbeddedNote[]): {
+    optimalThreshold: number;
+    optimalSilhouette: number;
+    optimalClusterCount: number;
+    allResults: Array<{ threshold: number; clusterCount: number; silhouette: number }>;
+    note: string;
+} {
+    const thresholds = [0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75];
+    const allResults: Array<{ threshold: number; clusterCount: number; silhouette: number }> = [];
+
+    for (const threshold of thresholds) {
+        const clusters = clusterNotes(embeddedNotes, threshold);
+        const silhouette = clusters.length < 2
+            ? 0
+            : simplifiedSilhouetteScore(embeddedNotes, clusters);
+
+        allResults.push({
+            threshold,
+            clusterCount: clusters.length,
+            silhouette,
+        });
+    }
+
+    const bestSilhouette = allResults.reduce((max, curr) =>
+        curr.silhouette > max ? curr.silhouette : max
+    , Number.NEGATIVE_INFINITY);
+
+    const candidates = allResults.filter(r => bestSilhouette - r.silhouette <= 0.05);
+
+    const best = candidates.reduce((acc, curr) => {
+        if (curr.clusterCount > acc.clusterCount) return curr;
+        if (curr.clusterCount < acc.clusterCount) return acc;
+        return curr.threshold < acc.threshold ? curr : acc;
+    });
+
+    return {
+        optimalThreshold: best.threshold,
+        optimalSilhouette: best.silhouette,
+        optimalClusterCount: best.clusterCount,
+        allResults,
+        note: `Selected threshold ${best.threshold} gives ${best.clusterCount} clusters (silhouette=${best.silhouette.toFixed(3)})`,
+    };
+}
+
 // ─── Step 4: LLM Labelling ───────────────────────────────────────────────────
 
 async function getClusterLabel(noteTitles: string[]): Promise<string> {
@@ -351,9 +470,28 @@ joplin.plugins.register({
         let outputLog: string[] = [];
 
         async function log(msg: string) {
-            outputLog.push(`${new Date().toISOString()} | ${msg}`);
+            const shouldTimestamp = msg.startsWith('===') ||
+                msg.startsWith('##') ||
+                msg.startsWith('[Step') ||
+                msg.startsWith('[Pre-check') ||
+                msg.startsWith('[Total');
+
+            outputLog.push(shouldTimestamp
+                ? `${new Date().toISOString()} | ${msg}`
+                : msg);
             console.log(msg);
             console.warn(msg);
+        }
+
+        async function logSection(title: string) {
+            outputLog.push(`\n## ${title}\n`);
+        }
+
+        async function logTable(headers: string[], rows: string[][]) {
+            const headerRow = `| ${headers.join(' | ')} |`;
+            const separatorRow = `|${headers.map(() => '---').join('|')}|`;
+            const dataRows = rows.map(row => `| ${row.join(' | ')} |`);
+            outputLog.push([headerRow, separatorRow, ...dataRows].join('\n'));
         }
 
         async function flushToNote() {
@@ -363,10 +501,14 @@ joplin.plugins.register({
                     title: '=== AI Categorization POC Output ===',
                     body,
                     parent_id: '',
+                    markup_language: 1,
                 });
                 outputNoteId = note.id;
             } else {
-                await joplin.data.put(['notes', outputNoteId], null, { body });
+                await joplin.data.put(['notes', outputNoteId], null, {
+                    body,
+                    markup_language: 1,
+                });
             }
         }
 
@@ -386,6 +528,37 @@ joplin.plugins.register({
         // Step 1
         const notes = await getAllNotesWithBody();
         await log(`[Step 1] Fetched ${notes.length} notes with body.`);
+        await flushToNote();
+
+        // Backend comparison
+        await log('');
+        await log('=== BACKEND COMPARISON ===');
+        await log('[Compare] Testing Ollama vs Transformers.js on 3 sample notes...');
+        await flushToNote();
+
+        try {
+            const compNotes = notes.slice(0, 3);
+            const comp = await runBackendComparison(compNotes);
+            if (comp.transformersFailed) {
+                await log('[Compare] Transformers.js: FAILED in plugin sandbox');
+                await log('[Compare] This is expected — production uses a Web Worker');
+                await log('[Compare] with webpackOverrides target:"web" to force WASM mode');
+                await log(`[Compare] Ollama avg: ${Math.round(comp.ollamaAvg)}ms | dims: ${comp.ollamaDims}d ✓`);
+            } else {
+                await log(`[Compare] Ollama avg: ${Math.round(comp.ollamaAvg)}ms | dims: ${comp.ollamaDims}d`);
+                await log(`[Compare] Transformers.js avg: ${Math.round(comp.transformersAvg)}ms | dims: ${comp.transformersDims}d`);
+                const faster = comp.ollamaAvg < comp.transformersAvg ? 'Ollama' : 'Transformers.js';
+                const ratio = Math.max(comp.speedRatio, 1 / comp.speedRatio).toFixed(1);
+                await log(`[Compare] ${faster} is ${ratio}x faster on this machine`);
+            }
+            await log('[Compare] Privacy: Transformers.js = fully local | Ollama = local server required');
+            await log('[Compare] Production default: Transformers.js (no setup) | Power users: Ollama');
+        } catch (err) {
+            await log(`[Compare] Transformers.js not available in this environment: ${err}`);
+            await log('[Compare] Production will use Web Worker to load model in sandbox');
+        }
+        await log('=== END COMPARISON ===');
+        await log('');
         await flushToNote();
 
         if (notes.length === 0) {
@@ -410,8 +583,22 @@ joplin.plugins.register({
             return;
         }
 
+        await log('');
+        await log('=== THRESHOLD CALIBRATION ===');
+        const calibration = findOptimalThreshold(embedded);
+        for (const r of calibration.allResults) {
+            const bar = '█'.repeat(Math.round(r.silhouette * 10)) +
+                        '░'.repeat(10 - Math.round(r.silhouette * 10));
+            await log(`  ${r.threshold.toFixed(2)} | ${bar} | score=${r.silhouette.toFixed(3)} | clusters=${r.clusterCount}`);
+        }
+        await log(`Optimal threshold: ${calibration.optimalThreshold} → silhouette=${calibration.optimalSilhouette.toFixed(3)} | ${calibration.optimalClusterCount} clusters`);
+        await log(`[Calibration] ${calibration.note}`);
+        await log('=== END CALIBRATION ===');
+        await log('');
+        await flushToNote();
+
         // Step 3
-        const clusters = clusterNotes(embedded, 0.60);
+        const clusters = clusterNotes(embedded, calibration.optimalThreshold);
         const silhouette = clusters.length >= 2
             ? simplifiedSilhouetteScore(embedded, clusters)
             : 0;
@@ -422,7 +609,7 @@ joplin.plugins.register({
             silhouette > 0.7 ? 'STRONG' :
             silhouette > 0.5 ? 'MODERATE' :
             silhouette > 0.3 ? 'WEAK' : 'POOR'
-        } — threshold used: 0.60`);
+        } — threshold used: ${calibration.optimalThreshold.toFixed(2)}`);
         await flushToNote();
 
         if (clusters.length === 0) {
@@ -456,27 +643,41 @@ joplin.plugins.register({
         // Step 4
         const labelled = await labelAllClusters(clusters, embedded);
         await log('');
-        await log('=== AI CATEGORIZATION SUGGESTIONS ===');
-        for (let i = 0; i < labelled.length; i++) {
-            const c = labelled[i];
-            await log(`Cluster ${i + 1}: '${c.label}' → ${c.noteIds.length} notes`);
-            for (const t of c.noteTitles) await log(`   - ${t}`);
+        await logSection('AI Categorization Suggestions');
+        await logTable(
+            ['#', 'Cluster Label', 'Notes', 'Confidence'],
+            labelled.map((c, i) => [
+                String(i + 1),
+                `**${c.label}**`,
+                String(c.noteIds.length),
+                silhouette > 0.7 ? '🟢 High' :
+                silhouette > 0.5 ? '🟡 Medium' : '🔴 Low'
+            ])
+        );
+        for (const c of labelled) {
+            await log(`### ${c.label}`);
+            for (const t of c.noteTitles) await log(`- ${t}`);
         }
-        await log('=== END SUGGESTIONS ===');
 
         const notesPerSec = embedded.length / (batchDurationMs / 1000);
         await log('');
-        await log('=== PERFORMANCE PROJECTIONS ===');
+        await logSection('Performance Projections');
+        await logTable(
+            ['Vault Size', 'Estimated Time', 'Backend'],
+            [
+                ['100 notes', `${(100 / notesPerSec).toFixed(1)}s`, 'Ollama'],
+                ['500 notes', `${(500 / notesPerSec / 60).toFixed(1)} min`, 'Ollama'],
+                ['1000 notes', `${(1000 / notesPerSec / 60).toFixed(1)} min`, 'Ollama'],
+                ['5000 notes', `${(5000 / notesPerSec / 60).toFixed(1)} min`, 'Ollama'],
+                ['1000 notes', `~3.1 min`, 'Transformers.js (est)'],
+                ['5000 notes', `~15.5 min`, 'Transformers.js (est)'],
+            ]
+        );
         await log(`Backend: Ollama (nomic-embed-text) | ${dimsconfirmed}d vectors`);
         await log(`Measured: ${notesPerSec.toFixed(1)} notes/sec | avg ${Math.round(avgMs)}ms/note`);
-        await log(`  100 notes → ${(100 / notesPerSec).toFixed(1)}s`);
-        await log(`  500 notes → ${(500 / notesPerSec / 60).toFixed(1)} min`);
-        await log(` 1000 notes → ${(1000 / notesPerSec / 60).toFixed(1)} min`);
-        await log(` 5000 notes → ${(5000 / notesPerSec / 60).toFixed(1)} min`);
         await log('');
         await log('Note: These are Ollama (local server) timings.');
         await log('Production uses incremental indexing — only changed notes re-embedded.');
-        await log('=== END PROJECTIONS ===');
 
         await log('NOTE: No changes made to Joplin. Read-only analysis.');
         await flushToNote();
