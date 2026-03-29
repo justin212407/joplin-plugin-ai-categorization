@@ -1,3 +1,9 @@
 {
-	"extraScripts": []
+	"extraScripts": ["worker.ts"],
+	"webpackOverrides": {
+		"entry": {
+			"worker": "./src/worker.ts"
+		},
+		"target": "web"
+	}
 }

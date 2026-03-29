@@ -170,6 +170,76 @@ async function runBackendComparison(testNotes: NoteWithBody[]): Promise<{
     return { ollamaAvg, transformersAvg, speedRatio, ollamaDims, transformersDims, transformersFailed };
 }
 
+async function benchmarkTransformersWorker(notes: NoteWithBody[]): Promise<
+    | { loadMs: number; avgMs: number; throughput: number; dims: number; success: true }
+    | { success: false; error: string }
+> {
+    try {
+        const workerPath = await joplin.plugins.installationDir() + '/worker.js';
+        const worker = new Worker(workerPath);
+
+        const loadMs = await new Promise<number>((resolve) => {
+            worker.onmessage = (e) => {
+                if (e.data.type === 'loaded') resolve(e.data.loadMs);
+            };
+            worker.postMessage({ type: 'load' });
+        });
+
+        const sampleNotes = notes.slice(0, 5);
+        const timings: number[] = [];
+        let dims = 0;
+        const benchmarkStart = Date.now();
+
+        for (const note of sampleNotes) {
+            const result = await new Promise<{
+                inferenceMs: number;
+                dims: number;
+            }>((resolve, reject) => {
+                worker.onmessage = (e) => {
+                    if (e.data.type === 'error' && e.data.noteId === note.id) {
+                        reject(new Error(e.data.error || 'Worker embedding error'));
+                        return;
+                    }
+
+                    if (e.data.type === 'embedding' && e.data.noteId === note.id) {
+                        resolve({ inferenceMs: e.data.inferenceMs, dims: e.data.dims });
+                    }
+                };
+
+                worker.postMessage({
+                    type: 'embed',
+                    text: note.title + '\n' + note.body,
+                    noteId: note.id,
+                });
+            });
+
+            timings.push(result.inferenceMs);
+            if (!dims) dims = result.dims;
+        }
+
+        const elapsedSec = (Date.now() - benchmarkStart) / 1000;
+        const avgMs = timings.length > 0
+            ? timings.reduce((acc, t) => acc + t, 0) / timings.length
+            : 0;
+        const throughput = elapsedSec > 0 ? sampleNotes.length / elapsedSec : 0;
+
+        worker.terminate();
+
+        return {
+            loadMs,
+            avgMs,
+            throughput,
+            dims,
+            success: true,
+        };
+    } catch (err) {
+        return {
+            success: false,
+            error: String(err),
+        };
+    }
+}
+
 async function embedAllNotes(notes: NoteWithBody[]): Promise<{ notes: EmbeddedNote[]; avgMs: number; dimsconfirmed: number }> {
     const results: EmbeddedNote[] = [];
     const timings: number[] = [];
@@ -659,6 +729,29 @@ joplin.plugins.register({
         }
         await log('=== END COMPARISON ===');
         await log('');
+        await flushToNote();
+
+        await log('');
+        await log('=== TRANSFORMERS.JS WEB WORKER BENCHMARK ===');
+        try {
+            const result = await benchmarkTransformersWorker(notes.slice(0, 5));
+            if (result.success) {
+                await log(`[Worker] Model loaded in ${result.loadMs}ms`);
+                await log(`[Worker] Avg latency: ${Math.round(result.avgMs)}ms/note`);
+                await log(`[Worker] Throughput: ${result.throughput.toFixed(1)} notes/sec`);
+                await log(`[Worker] Dimensions: ${result.dims}d`);
+                await log(`[Worker] 1000 notes → ${(1000/result.throughput/60).toFixed(1)} min (est)`);
+                await log(`[Worker] 5000 notes → ${(5000/result.throughput/60).toFixed(1)} min (est)`);
+                await log(`[Worker] Status: WORKING inside Joplin plugin sandbox ✓`);
+            } else {
+                const errorMessage = 'error' in result ? result.error : 'Unknown worker error';
+                await log(`[Worker] Failed: ${errorMessage}`);
+                await log(`[Worker] See webpackOverrides target:"web" fix`);
+            }
+        } catch (err) {
+            await log(`[Worker] Error: ${err}`);
+        }
+        await log('=== END WORKER BENCHMARK ===');
         await flushToNote();
 
         if (notes.length === 0) {
