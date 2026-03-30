@@ -288,6 +288,20 @@ function resolveExtraScriptPath(name) {
 	const s = name.split('.');
 	s.pop();
 	const nameNoExt = s.join('.');
+	const isWorkerScript = nameNoExt === 'worker';
+
+	// Worker scripts must not be emitted as CommonJS, otherwise runtime throws
+	// "ReferenceError: exports is not defined" in web worker contexts.
+	if (isWorkerScript) {
+		return {
+			entry: relativePath,
+			output: {
+				filename: `${nameNoExt}.js`,
+				path: distDir,
+				globalObject: 'self',
+			},
+		};
+	}
 
 	return {
 		entry: relativePath,
@@ -308,8 +322,27 @@ function buildExtraScriptConfigs(userConfig) {
 
 	for (const scriptName of userConfig.extraScripts) {
 		const scriptPaths = resolveExtraScriptPath(scriptName);
-		output.push({ ...extraScriptConfig, entry: scriptPaths.entry,
-			output: scriptPaths.output });
+
+		const s = scriptName.split('.');
+		s.pop();
+		const nameNoExt = s.join('.');
+		const isWorkerScript = nameNoExt === 'worker';
+
+		if (isWorkerScript) {
+			output.push({
+				...baseConfig,
+				entry: scriptPaths.entry,
+				resolve: extraScriptConfig.resolve,
+				output: scriptPaths.output,
+				externals: {},
+			});
+		} else {
+			output.push({
+				...extraScriptConfig,
+				entry: scriptPaths.entry,
+				output: scriptPaths.output,
+			});
+		}
 	}
 
 	return output;
